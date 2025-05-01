@@ -88,10 +88,14 @@ class ColorizeApp(tk.Tk):
         # state
         self.gray_np   = None      # grayscale luminance 0-1
         self.display   = None      # PhotoImage for canvas
-        self.scribble  = None      # H×W×3 float32 [0-1]
+        self.scribble  = None      # H×W×3 float32 [0-1] in RGB
         self.mask      = None      # H×W uint8 (not bool)
-        self.brush_col = (1.0, 0.0, 0.0)   # default red
+        self.brush_col = (1.0, 0.0, 0.0)   # default red in RGB
         self.brush_rad = tk.IntVar(value=5)
+        self.last_x = None
+        self.last_y = None
+        self.image_number = None
+        self.original_height, self.original_width = None, None
 
         # layout
         self.make_widgets()
@@ -132,6 +136,7 @@ class ColorizeApp(tk.Tk):
         # bind drawing events
         self.canvas.bind("<B1-Motion>", self.paint)
         self.canvas.bind("<Button-1>", self.paint)
+        self.canvas.bind("<ButtonRelease-1>", self.canvas_release)
 
     # --- file ops --- #
     def open_image(self):
@@ -139,16 +144,28 @@ class ColorizeApp(tk.Tk):
             filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff")])
         if not path:
             return
+        
+        # Extract image number from filename (image_X.jpg)
+        import re
+        match = re.search(r'image_(\d+)\.', path)
+        if match:
+            self.image_number = match.group(1)
+        else:
+            self.image_number = "1"  # default if pattern not found
+            
         img_gray = cv.imread(path, cv.IMREAD_GRAYSCALE)
         if img_gray is None:
             messagebox.showerror("Error", "Could not read image.")
             return
 
+        # Store original dimensions
+        self.original_height, self.original_width = img_gray.shape
+
         # normalise and init buffers
         self.gray_np  = img_gray.astype(np.float32) / 255.0
         h, w          = img_gray.shape
         self.scribble = np.zeros((h, w, 3), np.float32)
-        self.mask     = np.zeros((h, w), np.uint8)  # Changed from bool to uint8
+        self.mask     = np.zeros((h, w), np.uint8)
 
         # Calculate scaling factor if image is larger than max window size
         scale = 1.0
@@ -172,21 +189,54 @@ class ColorizeApp(tk.Tk):
         # show on canvas
         self.refresh_canvas(self.gray_np_to_rgb())
 
+    def save_scribble(self):
+        """Save the current view with scribbles overlaid"""
+        if self.gray_np is None or not self.mask.any():
+            messagebox.showinfo("Info", "No scribbles to save.")
+            return
+
+        # Create the overlay image
+        gray_rgb = self.gray_np_to_rgb()
+        overlay = (self.scribble * 255).astype(np.uint8)  # Already in RGB
+        alpha = self.mask.astype(np.float32) / 255.0 * 0.7
+        alpha = alpha[..., np.newaxis]
+        combined = (gray_rgb * (1 - alpha) + overlay * alpha).astype(np.uint8)
+
+        # Resize to original dimensions if needed
+        if combined.shape[:2] != (self.original_height, self.original_width):
+            combined = cv.resize(combined, (self.original_width, self.original_height))
+
+        # Save the scribble overlay
+        scribble_path = f"../Results/scribble_{self.image_number}.jpg"
+        Image.fromarray(combined).save(scribble_path, quality=95)
+
     def save_result(self):
         if not hasattr(self, "result_img"):
             messagebox.showinfo("Info", "No result to save yet.")
             return
-        out = filedialog.asksaveasfilename(defaultextension=".png",
-                                           filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")])
-        if out:
-            Image.fromarray(self.result_img).save(out)
-            messagebox.showinfo("Saved", f"Image written to:\n{out}")
+            
+        # Automatically save to Results folder with correct name
+        result_path = f"../Results/result_{self.image_number}.jpg"
+        
+        # Convert from BGR to RGB and resize if needed
+        result_rgb = cv.cvtColor(self.result_img, cv.COLOR_BGR2RGB)
+        if result_rgb.shape[:2] != (self.original_height, self.original_width):
+            result_rgb = cv.resize(result_rgb, (self.original_width, self.original_height))
+        
+        # Save with high quality
+        Image.fromarray(result_rgb).save(result_path, quality=95)
+        
+        # Also save the scribble overlay
+        self.save_scribble()
+        
+        messagebox.showinfo("Saved", f"Saved result and scribbles to Results folder")
 
     # --- drawing tools --- #
     def pick_colour(self):
-        col = colorchooser.askcolor()[0]   # (R, G, B) 0-255
-        if col:
-            self.brush_col = tuple(c / 255.0 for c in col)
+        color = colorchooser.askcolor()[0]  # Returns RGB tuple
+        if color:
+            # Store in RGB (no conversion needed)
+            self.brush_col = tuple(c / 255.0 for c in color)
 
     def paint(self, event):
         if self.gray_np is None:
@@ -201,13 +251,26 @@ class ColorizeApp(tk.Tk):
             return
             
         r = self.brush_rad.get()
-        cv.circle(self.scribble, (x, y), r,
-                  self.brush_col, thickness=-1, lineType=cv.LINE_AA)
-        cv.circle(self.mask, (x, y), r, 255, thickness=-1)
+        
+        # Draw smooth line if we have a previous point
+        if self.last_x is not None and self.last_y is not None:
+            # Calculate intermediate points for smooth line
+            points = self.get_line_points(self.last_x, self.last_y, x, y)
+            for px, py in points:
+                cv.circle(self.scribble, (px, py), r,
+                         self.brush_col, thickness=-1, lineType=cv.LINE_AA)
+                cv.circle(self.mask, (px, py), r, 255, thickness=-1)
+        else:
+            # Single point
+            cv.circle(self.scribble, (x, y), r,
+                     self.brush_col, thickness=-1, lineType=cv.LINE_AA)
+            cv.circle(self.mask, (x, y), r, 255, thickness=-1)
+
+        self.last_x, self.last_y = x, y
 
         # draw overlay on display copy
         disp = self.gray_np_to_rgb()
-        overlay = (self.scribble * 255).astype(np.uint8)
+        overlay = (self.scribble * 255).astype(np.uint8)  # Already in RGB
         
         # Create alpha mask for blending
         alpha = self.mask.astype(np.float32) / 255.0 * 0.7
@@ -217,6 +280,41 @@ class ColorizeApp(tk.Tk):
         disp = (disp * (1 - alpha) + overlay * alpha).astype(np.uint8)
         
         self.refresh_canvas(disp)
+
+    def get_line_points(self, x1, y1, x2, y2):
+        """Get points along a line using Bresenham's algorithm"""
+        points = []
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        x, y = x1, y1
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        
+        if dx > dy:
+            err = dx / 2.0
+            while x != x2:
+                points.append((x, y))
+                err -= dy
+                if err < 0:
+                    y += sy
+                    err += dx
+                x += sx
+        else:
+            err = dy / 2.0
+            while y != y2:
+                points.append((x, y))
+                err -= dx
+                if err < 0:
+                    x += sx
+                    err += dy
+                y += sy
+                
+        points.append((x2, y2))
+        return points
+
+    def canvas_release(self, event):
+        self.last_x = None
+        self.last_y = None
 
     # --- processing --- #
     def run_colorize(self):
@@ -230,24 +328,34 @@ class ColorizeApp(tk.Tk):
         self.config(cursor="watch")
         self.update_idletasks()
         try:
-            result = colorize(self.gray_np, self.scribble, self.mask)
+            # Convert scribble to BGR for colorize function
+            scribble_bgr = cv.cvtColor((self.scribble * 255).astype(np.uint8), cv.COLOR_RGB2BGR).astype(np.float32) / 255.0
+            result_bgr = colorize(self.gray_np, scribble_bgr, self.mask)
+            # Store result in BGR format
+            self.result_img = result_bgr
+            # Convert to RGB for display
+            result_rgb = cv.cvtColor(result_bgr, cv.COLOR_BGR2RGB)
+            
+            # Save both result and scribbles automatically
+            self.save_result()
+            
         except Exception as e:
             messagebox.showerror("Error", str(e))
             self.config(cursor="")
             return
         self.config(cursor="")
 
-        self.result_img = result
-        self.refresh_canvas(result)
+        self.refresh_canvas(result_rgb)
 
     # --- helpers --- #
     def gray_np_to_rgb(self):
-        rgb = (self.gray_np * 255).astype(np.uint8)
-        return cv.cvtColor(rgb, cv.COLOR_GRAY2RGB)
+        """Convert grayscale to RGB"""
+        rgb = cv.cvtColor((self.gray_np * 255).astype(np.uint8), cv.COLOR_GRAY2RGB)
+        return rgb
 
-    def refresh_canvas(self, img_bgr: np.ndarray):
-        img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
-        pil     = Image.fromarray(img_rgb)
+    def refresh_canvas(self, img_rgb: np.ndarray):
+        """Display RGB image on canvas"""
+        pil = Image.fromarray(img_rgb)
         self.display = ImageTk.PhotoImage(pil)
         self.canvas.config(width=pil.width, height=pil.height)
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.display)
