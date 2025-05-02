@@ -1,107 +1,123 @@
-#!/usr/bin/env python3
-# ------------------------------------------------------------
-# colorize.py – Levin–Lischinski–Weiss scribble colourisation
-# (fixed data-range handling, cleaned duplicates, safer paths)
-# Usage:
-#   python colorize.py <gray_filename> <scribble_filename> <result_filename>
-# ------------------------------------------------------------
-import sys
-import os
-import cv2
+import os, sys
 import numpy as np
-from tqdm import tqdm
+import cv2
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
+from tqdm import tqdm
 
-REG_EPS = 1e-3          # neutral-chroma regulariser strength
+# Directories (preserved from original structure)
 GRAY_DIR     = os.path.join("..", "Gray_Scale")
 SCRIBBLE_DIR = os.path.join("..", "Scribble")
 RESULT_DIR   = os.path.join("..", "Results")
 
-def pos2id(r, c, W): return r * W + c
+# Parameters (can be adjusted if needed)
+d = 1          # neighborhood radius (d=1 gives 3x3 window, d=2 gives 5x5, etc.)
+REG_EPS = 1e-6 # small regularization for intensity variance to avoid zero-division
 
-def neighbours(r, c, H, W, d=2):
-    for rr in range(max(0, r-d), min(H, r+d+1)):
-        for cc in range(max(0, c-d), min(W, c+d+1)):
-            if rr != r or cc != c:
-                yield rr, cc
+# Parse command-line arguments
+if len(sys.argv) != 4:
+    print("Usage: python colorize.py <gray_filename> <scribble_filename> <result_filename>")
+    sys.exit(1)
+gray_name = sys.argv[1]
+scribble_name = sys.argv[2]
+result_name = sys.argv[3]
 
-class Colorizer:
-    def __init__(self, gray_filename: str, scribble_filename: str, result_filename: str):
-        gray_path     = os.path.join(GRAY_DIR,     gray_filename)
-        scribble_path = os.path.join(SCRIBBLE_DIR, scribble_filename)
-        self.out_path = os.path.join(RESULT_DIR,   result_filename)
+# Construct file paths
+gray_path = os.path.join(GRAY_DIR, gray_name)
+scribble_path = os.path.join(SCRIBBLE_DIR, scribble_name)
+result_path = os.path.join(RESULT_DIR, result_name)
 
-        # ---------- load RGB images (uint8) ----------
-        rgb_u8   = cv2.cvtColor(cv2.imread(gray_path),     cv2.COLOR_BGR2RGB)
-        scrib_u8 = cv2.cvtColor(cv2.imread(scribble_path), cv2.COLOR_BGR2RGB)
+# Load images
+gray_img = cv2.imread(gray_path, cv2.IMREAD_GRAYSCALE)
+scribble_img = cv2.imread(scribble_path, cv2.IMREAD_COLOR)
+if gray_img is None or scribble_img is None:
+    print("Error: Could not load input images. Please check file names and paths.")
+    sys.exit(1)
+h, w = gray_img.shape[:2]
+# Ensure scribble image dimensions match grayscale image
+if scribble_img.shape[0] != h or scribble_img.shape[1] != w:
+    print("Error: Scribble image size does not match grayscale image size.")
+    sys.exit(1)
 
-        if rgb_u8 is None or scrib_u8 is None:
-            raise FileNotFoundError("One of the input files could not be read.")
-        if rgb_u8.shape != scrib_u8.shape:
-            raise ValueError("Gray and scribble images must be the same size.")
+# Convert scribble image to YUV to extract U and V values for scribbled pixels
+scribble_yuv = cv2.cvtColor(scribble_img, cv2.COLOR_BGR2YUV)
+scribble_U = scribble_yuv[:, :, 1].astype(np.float64)
+scribble_V = scribble_yuv[:, :, 2].astype(np.float64)
 
-        # ---------- convert to float32 in [0,1] first ----------
-        rgb_f   = rgb_u8  .astype(np.float32) / 255.0
-        scrib_f = scrib_u8.astype(np.float32) / 255.0
+# Identify scribble pixels by comparing scribble image to grayscale image
+# (If a pixel's BGR differs from the grayscale value, it has color scribble.)
+gray_3channel = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
+scribble_mask = np.any(scribble_img != gray_3channel, axis=2)  # boolean mask of scribbled pixels
 
-        # ---------- then to YUV (U,V centred on 0) ----------
-        self.yuv  = cv2.cvtColor(rgb_f,   cv2.COLOR_RGB2YUV)
-        self.syuv = cv2.cvtColor(scrib_f, cv2.COLOR_RGB2YUV)
+# Prepare the linear system: size N x N (N = total number of pixels)
+N = h * w
+# Arrays for sparse matrix construction
+rows, cols, vals = [], [], []
+# Right-hand side vectors for U and V (initialized to 0, will set scribble constraints)
+b_u = np.zeros(N, dtype=np.float64)
+b_v = np.zeros(N, dtype=np.float64)
 
-        self.rgb   = rgb_u8   # keep originals for hint detection
-        self.scrib = scrib_u8
+# Normalize grayscale intensities to [0,1] range for weight computation
+gray_norm = gray_img.astype(np.float64) / 255.0
 
-    # pixel considered a “hint” if scribble differs noticeably
-    def _hint(self, r, c):
-        return np.any(np.abs(self.rgb[r, c] - self.scrib[r, c]) > 10)
+# Build the sparse coefficient matrix (Laplacian matrix with constraints)
+for i in tqdm(range(h), desc="Constructing linear system"):
+    for j in range(w):
+        idx = i * w + j  # linear index of pixel (i,j)
+        if scribble_mask[i, j]:
+            # Scribble pixel: add constraint U(idx)=scribble_U, V(idx)=scribble_V
+            rows.append(idx); cols.append(idx); vals.append(1.0)
+            # Subtract 128 from U,V to use zero as no-color baseline (chrominance offset)
+            b_u[idx] = scribble_U[i, j] - 128.0
+            b_v[idx] = scribble_V[i, j] - 128.0
+        else:
+            # Non-scribble pixel: build smoothness constraints relative to neighbors
+            # Determine neighbor window bounds (clamped to image borders)
+            i0 = max(i - d, 0)
+            i1 = min(i + d, h - 1)
+            j0 = max(j - d, 0)
+            j1 = min(j + d, w - 1)
+            # Compute local intensity statistics
+            window = gray_norm[i0:i1+1, j0:j1+1]
+            var = float(np.var(window))
+            # Add regularization to variance to avoid zero (or extremely low) var
+            sigma2 = var + REG_EPS
+            # Compute weights for each neighbor in the window
+            weight_sum = 0.0
+            neighbor_weights = []  # will store (neighbor_idx, weight) for normalization
+            for ii in range(i0, i1+1):
+                for jj in range(j0, j1+1):
+                    if ii == i and jj == j:
+                        continue  # skip the center pixel itself
+                    neighbor_idx = ii * w + jj
+                    # Weight = exp[-(Y_i - Y_j)^2 / sigma^2]
+                    diff = gray_norm[i, j] - gray_norm[ii, jj]
+                    w_ij = np.exp(-(diff * diff) / sigma2)
+                    weight_sum += w_ij
+                    neighbor_weights.append((neighbor_idx, w_ij))
+            # Normalize weights and add entries to matrix
+            if weight_sum > 1e-12:  # if there is any weight
+                for (nbr_idx, w_ij) in neighbor_weights:
+                    rows.append(idx); cols.append(nbr_idx); vals.append(-w_ij / weight_sum)
+            # For stability, if weight_sum is 0 (no variation at all), we simply don't add off-diagonals.
+            # (This would mean the entire window is constant intensity; color will propagate uniformly.)
+            # Finally, add the diagonal entry
+            rows.append(idx); cols.append(idx); vals.append(1.0)
 
-    def colorize(self):
-        H, W = self.yuv.shape[:2]
-        N    = H * W
-        A  = sparse.lil_matrix((N, N), dtype=np.float32)
-        bu = np.full(N, REG_EPS * 0.5, dtype=np.float32)
-        bv = bu.copy()
+# Create the sparse matrix (in CSR format for solving)
+W = sparse.csr_matrix((vals, (rows, cols)), shape=(N, N))
 
-        for r in tqdm(range(H), desc="assembling"):
-            for c in range(W):
-                idx = pos2id(r, c, W)
-                Y   = self.yuv[r, c, 0]
+# Solve the sparse linear system for U and V channels
+# (We solve for U' and V' which are U,V minus 128 baseline)
+U_prime = spsolve(W, b_u)
+V_prime = spsolve(W, b_v)
 
-                if self._hint(r, c):                 # scribble pixel
-                    A[idx, idx] = 1.0 + REG_EPS
-                    bu[idx] += self.syuv[r, c, 1]
-                    bv[idx] += self.syuv[r, c, 2]
-                    continue
+# Combine the Y (intensity) channel with solved chrominance (U, V) channels
+Y_channel = gray_img.astype(np.uint8)  # original grayscale intensities [0,255]
+U_channel = np.clip(U_prime + 128.0, 0, 255).reshape(h, w).astype(np.uint8)
+V_channel = np.clip(V_prime + 128.0, 0, 255).reshape(h, w).astype(np.uint8)
 
-                nbr = list(neighbours(r, c, H, W, d=2))
-                Ys  = np.array([self.yuv[rr, cc, 0] for rr, cc in nbr])
-                ids = np.array([pos2id(rr, cc, W)   for rr, cc in nbr])
-
-                σ = np.std(Ys)
-                w = np.ones_like(Ys) if σ < 1e-6 else np.exp(-((Ys - Y) ** 2) / (2 * σ ** 2))
-                w /= w.sum()
-
-                A[idx, idx] = 1.0 + REG_EPS
-                A[idx, ids] -= w
-
-        A = A.tocsc()
-        U = spsolve(A, bu).reshape(H, W)
-        V = spsolve(A, bv).reshape(H, W)
-
-        out_yuv = np.dstack((self.yuv[..., 0], U, V))
-        rgb_f   = cv2.cvtColor(out_yuv.astype(np.float32), cv2.COLOR_YUV2RGB)
-        return (np.clip(rgb_f, 0, 1) * 255).astype(np.uint8)
-
-# ------------------- CLI wrapper ------------------------------
-if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("Usage: python colorize.py <gray_filename> <scribble_filename> <result_filename>")
-        sys.exit(1)
-
-    colorizer = Colorizer(sys.argv[1], sys.argv[2], sys.argv[3])
-    result    = colorizer.colorize()
-
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    cv2.imwrite(colorizer.out_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
-    print("✓ Saved to", colorizer.out_path)
+# Convert the result from YUV back to BGR for output
+result_yuv = cv2.merge([Y_channel, U_channel, V_channel])
+result_bgr = cv2.cvtColor(result_yuv, cv2.COLOR_YUV2BGR)
+cv2.imwrite(result_path, result_bgr)
